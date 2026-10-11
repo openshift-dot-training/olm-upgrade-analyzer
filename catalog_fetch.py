@@ -12,8 +12,9 @@ installed packages are pulled out of it:
 A package directory mixes a catalog.json with per-bundle files. Only the
 olm.channel objects are kept, which is exactly the data-v<major>.<minor>.json
 format the planner reads. Beside the catalog, packages-v<major>.<minor>.json
-records each package's defaultChannel, for the oc-mirror configuration, and
-each bundle's olm.maxOpenShiftVersion, for the planner.
+records each package's defaultChannel, for the oc-mirror configuration, each
+bundle's olm.maxOpenShiftVersion, for the planner, and each bundle's CSV name,
+OLM dependencies and provided GVKs, for the GitOps versions export.
 
 The registry credentials come from --authfile, or from the cluster pull secret
 when no authfile is given.
@@ -34,9 +35,10 @@ import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
-from ocp_planner import catalog_filename, extract_version_from_name, parse_ocp
+from ocp_planner import (catalog_filename, extract_version_from_name,
+                         normalize_version, parse_ocp)
 
 try:
     import yaml
@@ -151,10 +153,59 @@ def _bundle_max_ocp(bundle: Dict) -> Optional[str]:
     return None
 
 
+def _gvk(value: Dict) -> str:
+    return f"{value.get('group', '')}/{value.get('version', '')}/{value.get('kind', '')}"
+
+
+def _constraint_requires(value: Dict) -> List[Dict]:
+    """Requirements of an olm.constraint: package, gvk, or all of them."""
+    if 'package' in value:
+        pkg = value['package']
+        return [{'package': pkg.get('packageName'),
+                 'range': pkg.get('versionRange', '')}]
+    if 'gvk' in value:
+        return [{'gvk': _gvk(value['gvk'])}]
+    if 'all' in value:
+        out = []
+        for sub in value['all'].get('constraints') or []:
+            out += _constraint_requires(sub)
+        return out
+    # any / not / cel cannot be reduced to a list of requirements
+    return [{'unsupported': sorted(k for k in value if k != 'failureMessage')}]
+
+
+def bundle_metadata(bundle: Dict) -> Optional[Tuple[str, Dict]]:
+    """
+    (version, {'csv', 'requires', 'provides'}) of an olm.bundle: its CSV name,
+    its OLM dependencies (olm.package.required, olm.gvk.required and
+    olm.constraint) and the GVKs it provides (olm.gvk).
+    """
+    version, requires, provides = None, [], []
+    for prop in bundle.get('properties') or []:
+        kind, value = prop.get('type'), prop.get('value') or {}
+        if kind == 'olm.package':
+            version = normalize_version(value.get('version'))
+        elif kind == 'olm.package.required':
+            requires.append({'package': value.get('packageName'),
+                             'range': value.get('versionRange', '')})
+        elif kind == 'olm.gvk.required':
+            requires.append({'gvk': _gvk(value)})
+        elif kind == 'olm.constraint':
+            requires += _constraint_requires(value)
+        elif kind == 'olm.gvk':
+            provides.append(_gvk(value))
+    version = version or extract_version_from_name(bundle.get('name', ''))
+    if not version:
+        return None
+    return version, {'csv': bundle.get('name'), 'requires': requires,
+                     'provides': sorted(set(provides))}
+
+
 def read_package_dir(pkg_dir: Path):
     """
-    Collect the olm.channel objects, the defaultChannel and each bundle's
-    olm.maxOpenShiftVersion ({version: max}) of one package.
+    Collect the olm.channel objects, the defaultChannel, each bundle's
+    olm.maxOpenShiftVersion ({version: max}) and each bundle's metadata
+    ({version: bundle_metadata}) of one package.
 
     The package directory holds a catalog.json plus per-bundle files, possibly
     in subdirectories. Channels are de-duplicated by name.
@@ -162,6 +213,7 @@ def read_package_dir(pkg_dir: Path):
     channels: Dict[str, Dict] = {}
     default = None
     max_ocp: Dict[str, str] = {}
+    bundles: Dict[str, Dict] = {}
     for path in sorted(pkg_dir.rglob('*')):
         if not path.is_file() or path.suffix not in ('.json', '.yaml', '.yml'):
             continue
@@ -176,7 +228,10 @@ def read_package_dir(pkg_dir: Path):
                 top = _bundle_max_ocp(obj)
                 if ver and top:
                     max_ocp[ver] = top
-    return [channels[k] for k in sorted(channels)], default, max_ocp
+                meta = bundle_metadata(obj)
+                if meta:
+                    bundles[meta[0]] = meta[1]
+    return [channels[k] for k in sorted(channels)], default, max_ocp, bundles
 
 
 def _write_atomic(path: Path, text: str):
@@ -254,7 +309,8 @@ def _fetch_locked(ref, packages, data_path, pkgs_path, authfile, refresh,
     if data_path.is_file() and pkgs_path.is_file():
         known = json.loads(pkgs_path.read_text())
     # entries pulled before bundle metadata was recorded do not count
-    complete = {p for p, m in known.items() if 'maxOpenShiftVersion' in m}
+    complete = {p for p, m in known.items()
+                if 'maxOpenShiftVersion' in m and 'bundles' in m}
     if not refresh and set(packages) <= complete:
         return {'image': ref, 'path': str(data_path), 'reused': True,
                 'missing': sorted(p for p in packages
@@ -274,10 +330,10 @@ def _fetch_locked(ref, packages, data_path, pkgs_path, authfile, refresh,
                                 os_filter, insecure)
         channels, meta = [], {}
         for pkg in packages:
-            chans, default, max_ocp = read_package_dir(dirs[pkg])
+            chans, default, max_ocp, bundles = read_package_dir(dirs[pkg])
             channels.extend(chans)
             meta[pkg] = {'present': bool(chans), 'defaultChannel': default,
-                         'maxOpenShiftVersion': max_ocp}
+                         'maxOpenShiftVersion': max_ocp, 'bundles': bundles}
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -302,6 +358,15 @@ def load_bundle_max_ocp(catalog_dir: str, ocp: str) -> Dict[str, Dict[str, str]]
     if not path.is_file():
         return {}
     return {p: m.get('maxOpenShiftVersion') or {}
+            for p, m in json.loads(path.read_text()).items()}
+
+
+def load_bundles(catalog_dir: str, ocp: str) -> Dict[str, Dict[str, Dict]]:
+    """{package: {version: {'csv', 'requires', 'provides'}}} beside a pulled catalog."""
+    path = Path(catalog_dir) / packages_filename(ocp)
+    if not path.is_file():
+        return {}
+    return {p: m.get('bundles') or {}
             for p, m in json.loads(path.read_text()).items()}
 
 
