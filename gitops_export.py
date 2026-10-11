@@ -328,9 +328,9 @@ def build_versions(plan: Dict, bundles_for: Callable[[Dict], Dict],
              f"{cluster.get('name') or '-'}: OCP {cluster['current']} -> "
              f"{cluster['target']} ({cluster['channel']}).",
              "# Exact versions in the target catalog with their exact OLM dependencies.",
-             "# Merge into the GitOps repository: components/versions.yaml (defaults),",
-             "# group-values/<group>/versions.yaml (a group) or the cluster environment",
-             "# repository's config/main-values.yaml (one cluster).",
+             "# Merge into the GitOps config repository: components/versions.yaml (defaults),",
+             "# group-values/<group>/versions.yaml (a group) or",
+             "# clusters/<cluster>/main-values.yaml (one cluster).",
              "versions:" + ("" if entries else " {}")]
     order = ('channel', 'version', 'csv')
     for comp in sorted(entries):

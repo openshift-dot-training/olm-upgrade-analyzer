@@ -325,14 +325,14 @@ become keys of their parent component, e.g. `multicluster-engine` →
 
 ```bash
 python ocp_upgrade_planner.py -i outputs/catalog_mirror_check.json \
-    --gitops-repo ../openshift-gitops
+    --gitops-repo ../openshift-gitops-config
 ```
 
 Merge the block into the GitOps repository at the level that applies:
 
 - `components/versions.yaml` for every cluster
 - `group-values/<group>/versions.yaml` for a group
-- the cluster environment repository's `config/main-values.yaml` for one cluster
+- `clusters/<cluster>/main-values.yaml` for one cluster
 
 With hand-supplied catalogs (`--catalog-dir`), there is no bundle metadata, so
 the versions are exported without `csv` and `dependencies`.
