@@ -263,80 +263,6 @@ package still exists in the mirrored catalog. Dependencies (`main: false`) are
 added at the head of their channel. Where the package's default channel is not
 one of the mirrored channels, `defaultChannel` is set, as oc-mirror requires.
 
-### GitOps versions export
-
-`gitops-versions.yaml` is the target state of every planned operator, in the
-`versions:` format read by an OLM GitOps repository that does three things:
-
-- installs every operator with `installPlanApproval: Manual`
-- pins each operator to an exact version
-- approves only the InstallPlan that carries that exact CSV and its exact OLM
-  dependencies
-
-```yaml
-versions:
-  # odf-operator: operator_upgrade_required
-  odf:
-    channel: stable-4.20
-    version: 4.20.2-rhodf
-    csv: odf-operator.v4.20.2-rhodf
-    dependencies:
-      - mcg-operator.v4.20.2-rhodf
-      - ocs-operator.v4.20.2-rhodf
-      - odf-dependencies.v4.20.2-rhodf
-      - rook-ceph-operator.v4.20.2-rhodf
-  # advanced-cluster-management: operator_upgrade_required
-  acm:
-    channel: release-2.13
-    version: 2.13.0
-    csv: advanced-cluster-management.v2.13.0
-    mceChannel: stable-2.8
-    mceVersion: 2.8.0
-    dependencies: []
-```
-
-The versions above are illustrative. How each entry is built:
-
-- **Goal.** `channel` and `version` are each operator's goal, from the plan in
-  the target catalog.
-- **`csv`.** The bundle's real name. Vendor suffixes such as `-rhodf` are kept,
-  so no CSV-name format has to be guessed.
-- **`dependencies`.** Each bundle declares what OLM installs with it:
-  `olm.package.required`, `olm.gvk.required` and `olm.constraint`. These are
-  recorded when the catalogs are pulled (`packages-v<x.y>.json`) and resolved
-  transitively, the way OLM resolves them:
-  - for a version range, the highest bundle that satisfies it;
-  - for a required GVK, the highest bundle that provides it.
-- **New dependencies.** A dependency package that is not installed yet is
-  pulled on demand. These are usually new dependencies of the target version,
-  which also need mirroring.
-- **Notes.** What cannot be resolved is written as a `# NOTE` at the end of the
-  file and in `plan.json` (`gitops_notes`). This covers two cases: a GVK whose
-  providing package was never pulled (add that package to the input with
-  `main: false`), and an `any`/`not` constraint.
-
-**Component names.** By default each entry is keyed by its package name.
-`--gitops-repo <checkout>` maps packages to the GitOps repository's component
-names, using `components/*/values.yaml` → `subscription.name`. Subscriptions
-that an operator creates itself at runtime are declared there as
-`approver.extra`, with `subscription`, `versionKey` and `channelKey`. They
-become keys of their parent component, e.g. `multicluster-engine` →
-`acm.mceVersion` / `acm.mceChannel`.
-
-```bash
-python ocp_upgrade_planner.py -i outputs/catalog_mirror_check.json \
-    --gitops-repo ../openshift-gitops-config
-```
-
-Merge the block into the GitOps repository at the level that applies:
-
-- `components/versions.yaml` for every cluster
-- `group-values/<group>/versions.yaml` for a group
-- `clusters/<cluster>/main-values.yaml` for one cluster
-
-With hand-supplied catalogs (`--catalog-dir`), there is no bundle metadata, so
-the versions are exported without `csv` and `dependencies`.
-
 ### Matching against the catalogs
 
 Names and versions are matched leniently against the catalogs, since a
@@ -380,8 +306,6 @@ A mismatch is rejected rather than guessed:
 | `--insecure-registry` | off | Pull catalogs over HTTP or with an untrusted certificate |
 | `-d`, `--output-dir` | `output` | Holds one folder per cluster and the shared `catalogs/` |
 | `--imageset-out` | `<output-dir>/<cluster_name>/imageset-config.yaml` | oc-mirror ImageSetConfiguration path |
-| `--gitops-out` | `<output-dir>/<cluster_name>/gitops-versions.yaml` | GitOps versions block path |
-| `--gitops-repo` | — | GitOps repository checkout; maps packages to its component names |
 | `-j`, `--json-out` | — | Also write the plan JSON to this file |
 | `-q`, `--quiet` | off | Suppress progress output on stderr |
 
@@ -411,7 +335,6 @@ output/
     html/index.html               cluster summary
     html/<operator>/index.html    per-operator report
     imageset-config.yaml          oc-mirror configuration
-    gitops-versions.yaml          exact versions + OLM dependencies for GitOps
     plan.json                     the plan, also printed to stdout
   <next cluster>/
     ...
@@ -558,7 +481,6 @@ ocp_upgrade_planner.py    cluster planner CLI
 ocp_planner.py            planning engine
 ocp_report.py             HTML reports
 catalog_fetch.py          pulls catalogs from catalog index images
-gitops_export.py          GitOps versions block: exact CSVs and OLM dependencies
 mirror_plan.py            catalog mirroring check and oc-mirror configuration
 vendor_constraints.py     vendor support matrices
 fonts/                    Red Hat fonts for the reports (SIL OFL 1.1)
