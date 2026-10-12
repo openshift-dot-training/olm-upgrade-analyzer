@@ -5,8 +5,9 @@ OCP cluster upgrade planner - CLI.
 Reads the installed operators as JSON, checks each one against the target
 release's catalog first, working backwards to an intermediate catalog only when
 the target does not cover it, and writes one HTML report per operator, a
-cluster summary and an oc-mirror ImageSetConfiguration. Machine-readable JSON
-goes to stdout.
+cluster summary, an oc-mirror ImageSetConfiguration and a GitOps versions
+block (exact CSVs with their OLM dependencies). Machine-readable JSON goes to
+stdout.
 
     python ocp_upgrade_planner.py -i examples/catalog_mirror_check.json
 
@@ -28,7 +29,7 @@ configuration.
       ]
     }
 
-The outputs - html/, imageset-config.yaml and plan.json - go to
+The outputs - html/, imageset-config.yaml, gitops-versions.yaml and plan.json - go to
 <output-dir>/<cluster_name>/, so many clusters can share one output directory.
 Pulled catalogs are shared between them in <output-dir>/catalogs/. Catalog
 files are named data-v<major>.<minor>.json, one per OCP release.
@@ -44,16 +45,22 @@ Exit codes:
 import argparse
 import json
 import re
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 from catalog_fetch import (
     FetchError,
+    cluster_authfile,
     fetch_all,
+    fetch_catalog,
     load_bundle_max_ocp,
+    load_bundles,
     load_default_channels,
     retag,
 )
+from gitops_export import ExportError, build_versions, component_map
 from mirror_plan import (
     BLOCKED,
     INTERMEDIATE,
@@ -269,11 +276,14 @@ def _apply_vendor(res, op, constraints, component_overrides, cluster_info,
 
 
 def run(payload, catalog_dirs, output_dir, quiet=False, imageset_out=None,
-        fetched=False, constraints=None, component_overrides=None):
+        fetched=False, constraints=None, component_overrides=None,
+        gitops_out=None, gitops_repo=None, puller=None):
     """
     catalog_dirs maps each group's pull_image to the directory holding its
     catalogs. fetched marks catalogs pulled at run time, which are empty when
-    the image carries none of the packages.
+    the image carries none of the packages. puller(image, ocp, packages, dir)
+    pulls more packages into a catalog, for dependencies of the target
+    versions that are not installed yet.
     """
     cluster, groups = parse_payload(payload)
     current, target, channel, ocp_path = resolve_ocp_path(cluster)
@@ -350,6 +360,12 @@ def run(payload, catalog_dirs, output_dir, quiet=False, imageset_out=None,
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(build_imageset(imageset))
 
+    gitops_path = Path(gitops_out or Path(output_dir) / 'gitops-versions.yaml')
+    gitops_notes = _write_gitops_versions(
+        gitops_path, cluster_info, results, catalog_dirs, target,
+        component_map(gitops_repo) if gitops_repo else None,
+        puller if fetched else None, quiet)
+
     plan = {
         'cluster': cluster_info,
         'verdict': verdict,
@@ -360,10 +376,46 @@ def run(payload, catalog_dirs, output_dir, quiet=False, imageset_out=None,
         'catalogs': {o: catalog_filename(o) for o in ocp_path},
         'catalogs_to_mirror': to_mirror,
         'imageset_config': str(path),
+        'gitops_versions': str(gitops_path),
+        'gitops_notes': gitops_notes,
         'operators': results,
     }
     plan['summary_html'] = generate_summary_report(plan, output_dir)
     return plan
+
+
+def _write_gitops_versions(path, cluster_info, results, catalog_dirs, target,
+                           mapping, puller, quiet):
+    """Write the GitOps versions block (see gitops_export); return its notes."""
+    def bundles_for(res):
+        # the operator's own catalog first, then the other catalog images
+        own = catalog_dirs[res['catalog_image']]
+        merged = {}
+        for d in [d for d in catalog_dirs.values() if d != own] + [own]:
+            merged.update(load_bundles(d, target))
+        return merged
+
+    def fetch_for(res):
+        if puller is None:
+            return None
+        image, d = res['catalog_image'], catalog_dirs[res['catalog_image']]
+
+        def fetch(packages):
+            if not quiet:
+                print(f"  dependency packages {', '.join(packages)}", file=sys.stderr)
+            puller(image, target, packages, Path(d))
+            found = load_bundles(d, target)
+            return {p: found[p] for p in packages if found.get(p)}
+        return fetch
+
+    text, notes = build_versions({'cluster': cluster_info, 'operators': results},
+                                 bundles_for, fetch_for, mapping)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    if not quiet:
+        for note in notes:
+            print(f"  gitops: {note}", file=sys.stderr)
+    return notes
 
 
 def main():
@@ -377,6 +429,7 @@ Examples:
   %(prog)s -i outputs/catalog_mirror_check.json --catalog-dir /path/to/catalogs
   %(prog)s -i outputs/catalog_mirror_check.json \\
       --component-version portworx-enterprise=3.6.0
+  %(prog)s -i outputs/catalog_mirror_check.json --gitops-repo ../openshift-gitops-config
 """)
     ap.add_argument('-i', '--input', help='Input JSON file (default: stdin)')
     ap.add_argument('--catalog-dir',
@@ -415,6 +468,12 @@ Examples:
     ap.add_argument('--imageset-out',
                     help='Where to write the oc-mirror ImageSetConfiguration '
                          '(default: <output-dir>/<cluster_name>/imageset-config.yaml)')
+    ap.add_argument('--gitops-out',
+                    help='Where to write the GitOps versions block '
+                         '(default: <output-dir>/<cluster_name>/gitops-versions.yaml)')
+    ap.add_argument('--gitops-repo',
+                    help='GitOps repository checkout; its components/*/values.yaml '
+                         'map OLM packages to component names in gitops-versions.yaml')
     ap.add_argument('-j', '--json-out',
                     help='Also write the plan JSON to this file')
     ap.add_argument('-q', '--quiet', action='store_true',
@@ -465,10 +524,28 @@ Examples:
                 raise ValueError(f"--component-version expects NAME=VERSION, "
                                  f"got {item!r}")
             overrides[name.strip()] = ver.strip()
-        plan = run(payload, catalog_dirs, str(cluster_dir), args.quiet,
-                   args.imageset_out, fetched,
-                   load_constraints(args.constraints), overrides)
-    except (ValueError, FileNotFoundError, FetchError) as e:
+        tmp = []
+
+        def puller(image, ocp, packages, dest):
+            """Pull more packages into an already pulled catalog."""
+            auth = args.authfile
+            if not auth:
+                if not tmp:
+                    tmp.append(tempfile.mkdtemp(prefix='olm-auth-'))
+                    tmp.append(cluster_authfile(tmp[0]))
+                auth = tmp[1]
+            fetch_catalog(image, ocp, packages, dest, auth, False,
+                          args.filter_by_os, args.insecure_registry)
+
+        try:
+            plan = run(payload, catalog_dirs, str(cluster_dir), args.quiet,
+                       args.imageset_out, fetched,
+                       load_constraints(args.constraints), overrides,
+                       args.gitops_out, args.gitops_repo, puller)
+        finally:
+            if tmp:
+                shutil.rmtree(tmp[0], ignore_errors=True)
+    except (ValueError, FileNotFoundError, FetchError, ExportError) as e:
         print(f"{e}", file=sys.stderr)
         return EXIT_ERROR
 
@@ -481,6 +558,7 @@ Examples:
     if not args.quiet:
         print(f"\nSummary: {plan['summary_html']}", file=sys.stderr)
         print(f"oc-mirror: {plan['imageset_config']}", file=sys.stderr)
+        print(f"GitOps versions: {plan['gitops_versions']}", file=sys.stderr)
 
     return {BLOCKED: EXIT_BLOCKED,
             INTERMEDIATE: EXIT_CRITICAL,

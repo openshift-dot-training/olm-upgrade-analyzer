@@ -120,6 +120,21 @@ operator is planned backwards from the target catalog, which also gives the
 catalogs a disconnected cluster must mirror.
 
 ### Added
+- GitOps versions export, `<output-dir>/<cluster_name>/gitops-versions.yaml`
+  (`--gitops-out`). For every planned operator it gives the target catalog's
+  goal channel and version, the exact CSV, and the exact CSVs of its OLM
+  dependencies (`olm.package.required`, `olm.gvk.required`, `olm.constraint`,
+  resolved transitively). The output is a `versions:` block that an OLM GitOps
+  repository with Manual approval and exact-version InstallPlan approvers can
+  merge as is. `--gitops-repo` maps packages to that repository's component
+  names, and runtime-created Subscriptions such as `multicluster-engine` to
+  their parent component's version keys. Dependency packages of the target
+  versions that are not installed yet are pulled on demand. Anything that
+  cannot be resolved is reported as a `# NOTE` and in `plan.json`
+  (`gitops_notes`).
+- `packages-v<major>.<minor>.json` records each bundle's CSV name,
+  dependencies and provided GVKs. Catalogs pulled before are pulled again
+  once.
 - The catalog mirror check written by ocp_preupgrade_health_check (task 89b),
   `outputs/catalog_mirror_check.json`, is accepted as input. Operators are
   grouped by catalog index image; packages with `main: false` are dependencies
